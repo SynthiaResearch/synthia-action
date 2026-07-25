@@ -1,8 +1,8 @@
 {
   "name": "@synthiaresearch/action",
   "private": true,
-  "version": "0.1.0",
-  "description": "GitHub Action for Synthia agent evals — bundled JS, no runtime registry fetch",
+  "version": "1.3.0",
+  "description": "GitHub Action for Synthia agent evals \u2014 bundled JS, no runtime registry fetch",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",

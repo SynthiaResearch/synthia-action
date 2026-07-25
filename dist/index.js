@@ -31225,26 +31225,38 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, resolve } from "node:path";
 var DEFAULT_BASE_URL = "https://synthia-research--synthia-api-web.modal.run";
-var SDK_VERSION = "0.0.11";
-var AUDIO_SUFFIXES = /* @__PURE__ */ new Set([".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm"]);
-function asAudioB64(value) {
-  if (value instanceof Uint8Array)
-    return Buffer.from(value).toString("base64");
-  if (typeof value === "string" && AUDIO_SUFFIXES.has(extname(value).toLowerCase())) {
-    return readFileSync(value).toString("base64");
+var SDK_VERSION = "0.1.0";
+var QUALITY_CHECK_CHUNK = 500;
+var FILE_SUFFIXES = /* @__PURE__ */ new Set([
+  ".wav",
+  ".mp3",
+  ".m4a",
+  ".ogg",
+  ".flac",
+  ".webm",
+  ".aac",
+  ".aiff",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".pdf",
+  ".docx",
+  ".pptx",
+  ".xlsx"
+]);
+function asFileUpload(value) {
+  if (value instanceof Uint8Array) {
+    return { file_b64: Buffer.from(value).toString("base64"), filename: null };
+  }
+  if (typeof value === "string" && FILE_SUFFIXES.has(extname(value).toLowerCase())) {
+    return {
+      file_b64: readFileSync(value).toString("base64"),
+      filename: basename(value)
+    };
   }
   return null;
-}
-function translateVoice403(e) {
-  if (e instanceof HttpError && e.status === 403) {
-    let detail = "voice is not enabled for this account";
-    try {
-      detail = JSON.parse(e.body).detail ?? detail;
-    } catch {
-    }
-    return new Error(`${detail} \u2014 voice is enabled per customer config; ask your Synthia contact to turn it on for your organization`);
-  }
-  return e;
 }
 var INTERACTIVE_STEMS = /* @__PURE__ */ new Set(["", "node", "npx", "tsx", "ts-node"]);
 function defaultSessionName() {
@@ -31254,6 +31266,11 @@ function defaultSessionName() {
     return basename(process.cwd());
   const p = resolve(argv1);
   return `${basename(dirname(p))}/${stem}`;
+}
+function sameIdSet(a, b) {
+  const left = new Set(a ?? []);
+  const right = new Set(b);
+  return left.size === right.size && [...right].every((id) => left.has(id));
 }
 function pyJson(v) {
   if (v === null || v === void 0)
@@ -31278,6 +31295,13 @@ var ToolSandbox = class _ToolSandbox {
   failTools;
   state;
   events = [];
+  /**
+   * Per-rollout scratch space for YOUR agent's state (stores, clients,
+   * framework sessions): created fresh for every rollout and dies with it.
+   * `sandbox.context.world ??= makeWorld()` — never key external maps by
+   * anything derived from the sandbox's identity.
+   */
+  context = {};
   constructor(seed, failTools, state) {
     this.seed = seed;
     this.failTools = failTools ?? /* @__PURE__ */ new Set();
@@ -31378,13 +31402,34 @@ var Http = class {
     for (const [k, v] of Object.entries(params ?? {})) {
       url.searchParams.set(k, String(v));
     }
-    const send = () => fetch(url, {
+    const sendTo = (target) => fetch(target, {
       method,
       headers: { "content-type": "application/json", ...this.headers },
       body: body === void 0 ? void 0 : JSON.stringify(body),
       // Generous timeout: probe convergence runs model inference server-side.
-      signal: AbortSignal.timeout(3e5)
+      signal: AbortSignal.timeout(3e5),
+      // Manual: fetch would auto-follow a 303 as a GET, silently breaking
+      // POST semantics. Modal serves 303 attempt-token redirects while a
+      // deployment hands requests between containers; the token resumes
+      // the SAME attempt, so re-issuing the original method+body is safe —
+      // including turn-advance POSTs, which may be resumed, never retried.
+      redirect: "manual"
     });
+    const send = async () => {
+      let r = await sendTo(url);
+      for (let hop = 0; hop < 30 && r.status === 303; hop++) {
+        const location = r.headers.get("location") ?? "";
+        if (!location.includes("__modal_attempt_token"))
+          break;
+        r = await fetch(location, {
+          method: "GET",
+          headers: this.headers,
+          signal: AbortSignal.timeout(3e5),
+          redirect: "manual"
+        });
+      }
+      return r;
+    };
     const retryable = method === "GET" || isCreatePost(method, path);
     const maxAttempts = retryable ? 4 : 1;
     let lastErr;
@@ -31578,26 +31623,23 @@ var Seeds = class {
    * Upload seed material (documents, tool schemas, policies, traces...).
    *
    * Overloaded on `content`: an object is ingested as-is (text pipeline);
-   * raw bytes or a path to an audio file (.wav/.mp3/...) is uploaded and
-   * transcribed server-side (voice-enabled accounts only) — the transcript
-   * becomes the seed content.
+   * raw bytes or a path to a file (audio in any common container, an
+   * image, a PDF/Office document, plain text) is uploaded and handled
+   * server-side with zero parameters — audio is transcribed (and marks
+   * the seed voice-origin: rollouts on scenarios built from it run in
+   * voice mode), everything else is rendered to text.
    */
   async ingest(opts) {
-    const audioB64 = asAudioB64(opts.content);
-    if (audioB64 !== null) {
-      const filename = typeof opts.content === "string" ? basename(opts.content) : null;
-      try {
-        return await this.#http.post("/v1/seeds", {
-          kind: opts.kind,
-          source: opts.source,
-          audio_b64: audioB64,
-          audio_filename: filename,
-          version: opts.version ?? "1",
-          metadata: opts.metadata ?? {}
-        });
-      } catch (e) {
-        throw translateVoice403(e);
-      }
+    const upload = asFileUpload(opts.content);
+    if (upload !== null) {
+      return this.#http.post("/v1/seeds", {
+        kind: opts.kind,
+        source: opts.source,
+        file_b64: upload.file_b64,
+        filename: upload.filename,
+        version: opts.version ?? "1",
+        metadata: opts.metadata ?? {}
+      });
     }
     return this.#http.post("/v1/seeds", {
       kind: opts.kind,
@@ -31619,10 +31661,19 @@ var UserModels = class {
    * The agent runs locally; only probe questions, replies, and traced
    * tool calls travel over the wire. `verbose` prints the server's
    * telemetry (probe decisions, ingestion, inference) after each turn.
+   *
+   * `seedIds` attaches ingested seeds to the session. Unknown ids 404 and
+   * the server caps the count per session.
    */
   async createFromProbe(agent, opts = {}) {
-    const { maxTurns = 10, verbose = false } = opts;
-    let session = await this.#http.post("/v1/probe-sessions", { max_turns: maxTurns });
+    const { maxTurns = 10, verbose = false, seedIds } = opts;
+    const body = { max_turns: maxTurns };
+    if (seedIds !== void 0)
+      body["seed_ids"] = [...seedIds];
+    let session = await this.#http.post("/v1/probe-sessions", body);
+    if (seedIds !== void 0 && !sameIdSet(session.seed_ids, seedIds)) {
+      throw new Error(`server did not accept seed_ids (echoed ${JSON.stringify(session.seed_ids ?? [])}, requested ${JSON.stringify(seedIds)}); it is likely older than the grounding feature`);
+    }
     const events = new EventStream(this.#http, `/v1/probe-sessions/${session.id}/events`, verbose);
     while (session.status === "active") {
       const raw = await agent(session.next_probe);
@@ -31649,6 +31700,18 @@ var UserModels = class {
       representation_id: m.representation_id ?? null
     }));
   }
+  /**
+   * Submit user-authored scenarios against a user model. Each partial spec
+   * (only `user_goal` is required) is completed and grounded in the model's
+   * representation server-side, then stored. The returned `passed`/`judge`
+   * are ADVISORY — a failing verdict never blocks; the scenario is stored
+   * either way. Compose the results into a dataset with `datasets.compose`.
+   */
+  async submitScenarios(userModel, scenarios) {
+    const modelId = typeof userModel === "string" ? userModel : userModel.id;
+    const body = await this.#http.post(`/v1/user-models/${modelId}/scenarios`, { scenarios });
+    return body.data;
+  }
 };
 var Datasets = class {
   #http;
@@ -31668,9 +31731,11 @@ var Datasets = class {
   /**
    * Start a generation job. qualityCheckId names a completed quality
    * check whose results calibrate the batch's difficulty and coverage.
+   * guidance is an optional free-text steer that biases scenario content
+   * toward a theme or situation; it never overrides grounding.
    */
   async generate(userModel, opts = {}) {
-    const { count = 20, qualityCheckId } = opts;
+    const { count = 20, qualityCheckId, guidance } = opts;
     const modelId = typeof userModel === "string" ? userModel : userModel.id;
     const body = {
       user_model_id: modelId,
@@ -31678,8 +31743,28 @@ var Datasets = class {
     };
     if (qualityCheckId)
       body["quality_check_id"] = qualityCheckId;
+    if (guidance)
+      body["guidance"] = guidance;
     const data = await this.#http.post("/v1/generations", body);
     return new GenerationJob(data, this.#http);
+  }
+  /**
+   * Assemble a dataset from an explicit set of scenarios (custom, generated,
+   * or a mix) that all belong to `userModel`'s representation. This is how you
+   * reuse or curate existing scenarios: pass their ids (e.g. a subset of
+   * `dataset.rows()`, or scenarios from `userModels.submitScenarios`) and get
+   * back a new dataset that shares those scenario rows by reference.
+   */
+  async compose(userModel, scenarioIds, opts = {}) {
+    const modelId = typeof userModel === "string" ? userModel : userModel.id;
+    const body = {
+      user_model_id: modelId,
+      scenario_ids: scenarioIds
+    };
+    if (opts.label)
+      body["label"] = opts.label;
+    const data = await this.#http.post("/v1/datasets", body);
+    return new Dataset(data, this.#http);
   }
 };
 var QualityCheck = class {
@@ -31727,85 +31812,28 @@ var QualityCheck = class {
     return body.data;
   }
 };
-var VoiceRender = class {
-  id;
-  status;
-  scenario_id;
-  rollout_id;
-  params;
-  duration_ms;
-  wpm;
-  provenance;
-  error;
-  #http;
-  constructor(data, http) {
-    this.id = data.id;
-    this.status = data.status;
-    this.scenario_id = data.scenario_id ?? null;
-    this.rollout_id = data.rollout_id ?? null;
-    this.params = data.params ?? {};
-    this.duration_ms = data.duration_ms ?? null;
-    this.wpm = data.wpm ?? null;
-    this.provenance = data.provenance ?? null;
-    this.error = data.error ?? null;
-    this.#http = http;
-  }
-  /** Poll until the render finishes; verbose prints server telemetry
-   * (per-TTS-call latencies, take/mix progress). */
-  async wait(opts = {}) {
-    const { pollInterval = 2, timeout = 1800, verbose = false } = opts;
-    const events = new EventStream(this.#http, `/v1/voice-renders/${this.id}/events`, verbose);
-    const deadline = Date.now() + timeout * 1e3;
-    while (this.status === "running") {
-      if (Date.now() > deadline) {
-        throw new Error(`voice render ${this.id} still running after ${timeout}s`);
-      }
-      await sleep(pollInterval * 1e3);
-      const data = await this.#http.get(`/v1/voice-renders/${this.id}`);
-      this.status = data.status;
-      this.params = data.params ?? {};
-      this.duration_ms = data.duration_ms ?? null;
-      this.wpm = data.wpm ?? null;
-      this.provenance = data.provenance ?? null;
-      this.error = data.error ?? null;
-      await events.pump();
+async function fetchRenderAudio(http, renderId, opts = {}) {
+  const { pollInterval = 2, timeout = 1800 } = opts;
+  const deadline = Date.now() + timeout * 1e3;
+  let render = await http.get(`/v1/voice-renders/${renderId}`);
+  while (render.status === "running") {
+    if (Date.now() > deadline) {
+      throw new Error(`voice render ${renderId} still running after ${timeout}s`);
     }
-    await events.pump();
-    if (this.status !== "succeeded") {
-      throw new Error(`voice render ${this.id} failed: ${this.error}`);
-    }
-    return this;
+    await sleep(pollInterval * 1e3);
+    render = await http.get(`/v1/voice-renders/${renderId}`);
   }
-  /** The mixed conversation WAV. */
-  async audio() {
-    try {
-      return await this.#http.getBytes(`/v1/voice-renders/${this.id}/audio`);
-    } catch (e) {
-      throw translateVoice403(e);
-    }
+  if (render.status !== "succeeded") {
+    throw new Error(`voice render ${renderId} failed: ${render.error}`);
   }
-  /** Write the mixed conversation WAV to `path`; returns it. */
-  async saveAudio(path) {
-    writeFileSync(path, await this.audio());
-    return path;
-  }
-};
-async function createVoiceRender(http, body) {
-  const clean = Object.fromEntries(Object.entries(body).filter(([, v]) => v !== void 0 && v !== null));
-  try {
-    return new VoiceRender(await http.post("/v1/voice-renders", clean), http);
-  } catch (e) {
-    throw translateVoice403(e);
-  }
+  return http.getBytes(`/v1/voice-renders/${renderId}/audio`);
 }
 var Rollouts = class {
   #http;
   #sessionId;
-  #voiceAuto;
-  constructor(http, sessionId = null, voiceAuto = false) {
+  constructor(http, sessionId = null) {
     this.#http = http;
     this.#sessionId = sessionId;
-    this.#voiceAuto = voiceAuto;
   }
   /**
    * A stored rollout's full captured state: status, seed, transcript,
@@ -31814,31 +31842,9 @@ var Rollouts = class {
   async get(rolloutId) {
     return this.#http.get(`/v1/rollouts/${rolloutId}`);
   }
-  /**
-   * Voice a finished rollout: the transcript maps to a script
-   * deterministically (words verbatim; `annotate` may add delivery tags
-   * only), then N takes are rendered and spliced into one mixed WAV.
-   * Requires a voice-enabled customer config (throws otherwise).
-   */
-  async voice(rollout, opts = {}) {
-    const rolloutId = typeof rollout === "string" ? rollout : rollout.rollout_id;
-    return createVoiceRender(this.#http, {
-      rollout_id: rolloutId,
-      takes: opts.takes ?? 1,
-      stability: opts.stability,
-      annotate: opts.annotate ?? false,
-      phone_fx: opts.phoneFx ?? false,
-      room_tone: opts.roomTone ?? false,
-      voice_overrides: opts.voiceOverrides
-    });
-  }
-  /** One voiced turn's WAV (turns with an audio_url only). */
+  /** One turn's audio (turns with an audio_url only). */
   async turnAudio(rolloutId, idx) {
-    try {
-      return await this.#http.getBytes(`/v1/rollouts/${rolloutId}/turns/${idx}/audio`);
-    } catch (e) {
-      throw translateVoice403(e);
-    }
+    return this.#http.getBytes(`/v1/rollouts/${rolloutId}/turns/${idx}/audio`);
   }
   /**
    * Play a dataset's scenarios against `agent` (most recent dataset when
@@ -31884,22 +31890,13 @@ var Rollouts = class {
         const i = next++;
         results[i] = await this.runScenario(agent, rows[i].scenario_id, {
           maxTurns,
+          randomSeed: rows[i].random_seed ?? void 0,
           agentMeta,
           datasetId
         });
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, rows.length) }, worker));
-    if (this.#voiceAuto) {
-      for (const result of results) {
-        if (result.status === "completed") {
-          try {
-            result.voice_render = await this.voice(result, { takes: 1 });
-          } catch {
-          }
-        }
-      }
-    }
     return results;
   }
   /**
@@ -31908,7 +31905,7 @@ var Rollouts = class {
    * rollout: if its turn count moved past `priorTurn`, the write landed (only
    * the response was lost) — adopt that state. If it's unchanged and still
    * running, the write didn't land — it's safe to re-send once. A genuine 4xx
-   * (409 already-completed, 422 bad turn, 403 voice) is rethrown unchanged.
+   * (409 already-completed, 422 bad file/turn) is rethrown unchanged.
    */
   async #recoverTurn(rolloutId, priorTurn, body, original) {
     const transient = original instanceof TypeError || original instanceof HttpError && RETRYABLE_STATUS.has(original.status);
@@ -31945,14 +31942,22 @@ var Rollouts = class {
       agent: agentMeta ?? null,
       dataset_id: datasetId ?? null
     });
+    let sandbox = null;
     while (session.status === "running") {
-      const sandbox = ToolSandbox.fromConfig(session.sandbox);
+      if (sandbox === null) {
+        sandbox = ToolSandbox.fromConfig(session.sandbox);
+      } else {
+        sandbox.state = { ...session.sandbox.state };
+        sandbox.failTools = new Set(session.sandbox.fail_tools);
+        sandbox.events = [];
+      }
       const reply = await agent(session.transcript, sandbox);
-      const audioB64 = asAudioB64(reply);
+      const upload = asFileUpload(reply);
       const body = { tool_calls: sandbox.events };
-      if (audioB64 !== null) {
+      if (upload !== null) {
         body["reply"] = "";
-        body["audio_b64"] = audioB64;
+        body["file_b64"] = upload.file_b64;
+        body["filename"] = upload.filename;
       } else {
         body["reply"] = reply;
       }
@@ -31960,19 +31965,126 @@ var Rollouts = class {
       try {
         session = await this.#http.post(`/v1/rollouts/${session.id}/turns`, body);
       } catch (e) {
-        if (audioB64 !== null)
-          throw translateVoice403(e);
         session = await this.#recoverTurn(session.id, priorTurn, body, e);
       }
     }
-    return {
+    const result = {
       rollout_id: session.id,
       scenario_id: scenarioId,
       status: session.status,
       turns: session.turn,
       transcript: session.transcript,
-      tool_events: session.tool_events
+      tool_events: session.tool_events,
+      voiced: session.voiced ?? false,
+      voice_render_id: session.voice_render_id ?? null
     };
+    const renderId = result.voice_render_id;
+    if (renderId) {
+      result.audio = (opts2) => fetchRenderAudio(this.#http, renderId, opts2);
+      result.saveAudio = async (path, opts2) => {
+        writeFileSync(path, await fetchRenderAudio(this.#http, renderId, opts2));
+        return path;
+      };
+    }
+    return result;
+  }
+};
+var PII_DETECTORS = [
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "<redacted:email>"],
+  [/(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/g, "<redacted:ssn>"],
+  [/(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g, "<redacted:card>"],
+  [/(?<!\d)(?:\+?\d[\s.-]?){9,14}\d(?!\d)/g, "<redacted:phone>"],
+  [
+    /(?<!\d)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)/g,
+    "<redacted:ip>"
+  ]
+];
+var SENSITIVE_KEY = /email|phone|ssn|dob|birth|address|name|card|account|token|secret|password/i;
+function redactString(s, extra) {
+  let out = s;
+  for (const [re, repl] of PII_DETECTORS)
+    out = out.replace(re, repl);
+  return extra ? extra(out) : out;
+}
+function redactValue(value, extra, keyHint) {
+  if (typeof value === "string") {
+    if (keyHint && SENSITIVE_KEY.test(keyHint))
+      return "<redacted>";
+    return redactString(value, extra);
+  }
+  if (Array.isArray(value))
+    return value.map((v) => redactValue(v, extra));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = redactValue(v, extra, k);
+    }
+    return out;
+  }
+  return value;
+}
+function redactTrace(trace, extra) {
+  return {
+    transcript: trace.transcript.map((t) => ({
+      ...t,
+      content: redactString(t.content, extra)
+    })),
+    tool_events: trace.tool_events.map((e) => ({
+      ...e,
+      input: redactValue(e.input, extra),
+      output: e.output == null ? e.output : redactValue(e.output, extra)
+    }))
+  };
+}
+var TraceRecorder = class {
+  #turns = [];
+  #events = [];
+  /** Append a user turn. */
+  user(content) {
+    this.#turns.push({ role: "user", content });
+  }
+  /** Append an agent turn. */
+  agent(content) {
+    this.#turns.push({ role: "agent", content });
+  }
+  /** Record a real tool call the agent made on the current turn. */
+  report(name, output, opts = {}) {
+    this.#events.push({
+      name,
+      input: opts.input ?? {},
+      output,
+      is_error: opts.isError ?? false,
+      external: true,
+      turn_idx: Math.max(0, this.#turns.length - 1)
+    });
+  }
+  /** The captured trace. */
+  get trace() {
+    return { transcript: this.#turns, tool_events: this.#events };
+  }
+};
+var Traces = class {
+  #http;
+  constructor(http) {
+    this.#http = http;
+  }
+  /**
+   * Ingest a production issue trace: redact it client-side (required, always
+   * on), then distill it server-side into synthetic scenarios that reproduce
+   * the failure. The raw trace is never persisted. Returns the generation
+   * job — await its wait() for the dataset.
+   */
+  async ingest(trace, opts) {
+    const raw = trace instanceof TraceRecorder ? trace.trace : trace;
+    const redacted = redactTrace(raw, opts.redact);
+    const data = await this.#http.post("/v1/traces", {
+      transcript: redacted.transcript,
+      tool_events: redacted.tool_events,
+      source: opts.source,
+      error: opts.error ?? null,
+      count: opts.count ?? 20
+    });
+    return new GenerationJob(data, this.#http);
   }
 };
 function probeFromRollout(agent) {
@@ -31989,12 +32101,6 @@ var Synthia = class {
   sessionName;
   sessionId = null;
   invocationId = null;
-  /** Voice mode, mirrored from the account's customer config by the
-   * session handshake: enabled unlocks the voice surfaces; auto makes
-   * rollouts voice themselves. The `voice` option overrides the
-   * config-mirrored auto default for this client (see SynthiaOptions). */
-  voiceEnabled = false;
-  voiceAuto = false;
   /** CI floors/caps mirrored from the customer config by the handshake;
    * null when the account has no CI policy. Populated after ready(). */
   ciSettings = null;
@@ -32002,8 +32108,8 @@ var Synthia = class {
   userModels;
   datasets;
   rollouts;
+  traces;
   #http;
-  #voiceOverride;
   #ci;
   constructor(options = {}) {
     const apiKey = options.apiKey ?? process.env["SYNTHIA_API_KEY"];
@@ -32017,18 +32123,18 @@ var Synthia = class {
     } else {
       this.sessionName = process.env["SYNTHIA_SESSION"] || defaultSessionName();
     }
-    this.#voiceOverride = options.voice ?? null;
     this.#ci = options.ci ?? null;
     this.#http.ready = this.#startSession();
     this.seeds = new Seeds(this.#http);
     this.userModels = new UserModels(this.#http);
     this.datasets = new Datasets(this.#http);
-    this.rollouts = new Rollouts(this.#http, null, options.voice ?? false);
+    this.rollouts = new Rollouts(this.#http);
+    this.traces = new Traces(this.#http);
   }
   /**
    * Await the session handshake. Every request already waits on it
    * implicitly; call this to fail fast on a bad key and to read the
-   * handshake-mirrored fields (ciSettings, voiceEnabled) before acting.
+   * handshake-mirrored fields (ciSettings) before acting.
    */
   async ready() {
     await this.#http.ready;
@@ -32070,35 +32176,10 @@ var Synthia = class {
     const data = await r.json();
     this.sessionId = data.sdk_session_id;
     this.invocationId = data.sdk_invocation_id;
-    this.voiceEnabled = data.voice_enabled ?? false;
-    this.voiceAuto = data.voice_auto ?? false;
     this.ciSettings = data.ci ?? null;
-    if (this.#voiceOverride !== null) {
-      if (this.#voiceOverride && !this.voiceEnabled) {
-        throw new Error("voice: true but voice is not enabled for this account \u2014 voice is enabled per customer config; ask your Synthia contact to turn it on for your organization");
-      }
-      this.voiceAuto = this.#voiceOverride;
-    }
     this.#http.headers["X-Synthia-Session"] = this.sessionId;
     this.#http.headers["X-Synthia-Invocation"] = this.invocationId;
-    this.rollouts = new Rollouts(this.#http, this.sessionId, this.voiceAuto);
-  }
-  /**
-   * Voice one scenario (an LLM authors the full two-sided script) or one
-   * finished rollout (deterministic transcript transform). Exactly one
-   * source id. Requires a voice-enabled customer config.
-   */
-  async voiceRender(opts) {
-    return createVoiceRender(this.#http, {
-      scenario_id: opts.scenarioId,
-      rollout_id: opts.rolloutId,
-      takes: opts.takes ?? 1,
-      stability: opts.stability,
-      annotate: opts.annotate ?? false,
-      phone_fx: opts.phoneFx ?? false,
-      room_tone: opts.roomTone ?? false,
-      voice_overrides: opts.voiceOverrides
-    });
+    this.rollouts = new Rollouts(this.#http, this.sessionId);
   }
   /**
    * Probe + generate only when needed; otherwise reuse the latest dataset.
@@ -32119,14 +32200,7 @@ var Synthia = class {
    * scripts/sessions never trigger regeneration here.
    */
   async prepare(agent, opts = {}) {
-    const result = await this.#prepare(agent, opts);
-    if (opts.voice) {
-      result.voiceRenders = [];
-      for (const row of await result.dataset.download()) {
-        result.voiceRenders.push(await this.voiceRender({ scenarioId: row.scenario_id, takes: 1 }));
-      }
-    }
-    return result;
+    return this.#prepare(agent, opts);
   }
   /**
    * The whole evaluation in one call: prepare (probe + generate, or
@@ -32136,7 +32210,26 @@ var Synthia = class {
    * report files stay yours.
    */
   async run(agent, opts = {}) {
-    const { count = 20, dataset, probeAgent, maxTurns = 12, probeMaxTurns = 10, concurrency = 4, repeats = 1, minSuccessRate = 0.6, maxSuccessRate = 0.9, label, agentMeta, verbose = false } = opts;
+    const {
+      count = 100,
+      dataset,
+      probeAgent,
+      reprobe = false,
+      // No default — see #prepare: `undefined` and `[]` mean different things.
+      seedIds,
+      maxTurns = 12,
+      probeMaxTurns = 10,
+      concurrency = 4,
+      repeats = 1,
+      minSuccessRate = 0.6,
+      maxSuccessRate = 0.9,
+      label,
+      agentMeta,
+      verbose = false
+    } = opts;
+    if (dataset !== void 0 && seedIds !== void 0) {
+      throw new Error("seedIds has no effect with dataset \u2014 passing a dataset skips prepare(), and grounding is applied while probing");
+    }
     let prepare = null;
     let target;
     if (dataset !== void 0) {
@@ -32147,6 +32240,8 @@ var Synthia = class {
         maxTurns: probeMaxTurns,
         minSuccessRate,
         maxSuccessRate,
+        reprobe,
+        seedIds,
         verbose
       });
       target = prepare.dataset;
@@ -32159,9 +32254,17 @@ var Synthia = class {
         agentMeta
       }));
     }
-    const qualityCheck = await this.rollouts.qualityCheck(results, label);
-    await qualityCheck.wait({ verbose });
-    const evaluations = await qualityCheck.rollouts();
+    const chunks = [];
+    for (let i = 0; i < results.length; i += QUALITY_CHECK_CHUNK)
+      chunks.push(results.slice(i, i + QUALITY_CHECK_CHUNK));
+    const evaluations = [];
+    let qualityCheck;
+    for (const [part, chunk] of chunks.entries()) {
+      const chunkLabel = label && chunks.length > 1 ? `${label} ${part + 1}/${chunks.length}` : label;
+      qualityCheck = await this.rollouts.qualityCheck(chunk, chunkLabel);
+      await qualityCheck.wait({ verbose });
+      evaluations.push(...await qualityCheck.rollouts());
+    }
     const passed = evaluations.filter((e) => e.passed).length;
     return {
       prepare,
@@ -32173,8 +32276,30 @@ var Synthia = class {
     };
   }
   async #prepare(agent, opts) {
-    const { count = 20, maxTurns = 10, minSuccessRate = 0.6, maxSuccessRate = 0.9, verbose = false } = opts;
+    const {
+      count = 100,
+      maxTurns = 10,
+      minSuccessRate = 0.6,
+      maxSuccessRate = 0.9,
+      reprobe = false,
+      verbose = false,
+      // No default: `undefined` (unspecified) must stay distinct from `[]`
+      // (explicitly ungrounded), or every existing caller re-probes.
+      seedIds
+    } = opts;
     await this.#http.ready;
+    if (reprobe) {
+      return this.#probeAndGenerate(agent, {
+        count,
+        maxTurns,
+        verbose,
+        reason: "reprobe requested",
+        successRate: null,
+        qualityCheckId: null,
+        forceProbe: true,
+        seedIds
+      });
+    }
     const existing = await this.datasets.list(this.sessionId ?? void 0);
     if (!existing.length) {
       return this.#probeAndGenerate(agent, {
@@ -32183,7 +32308,8 @@ var Synthia = class {
         verbose,
         reason: this.sessionId ? "no datasets in this session yet" : "no datasets exist yet",
         successRate: null,
-        qualityCheckId: null
+        qualityCheckId: null,
+        seedIds
       });
     }
     const latest = await this.#http.get("/v1/quality-checks/latest", this.sessionId ? { sdk_session: this.sessionId } : void 0);
@@ -32197,7 +32323,8 @@ var Synthia = class {
         verbose,
         reason: `success rate ${pct(rate)} ${direction} ${pct(bound)}; regenerating calibrated on ${latest.id}`,
         successRate: rate,
-        qualityCheckId: latest.id ?? null
+        qualityCheckId: latest.id ?? null,
+        seedIds
       });
     }
     if (existing[0].row_count !== count) {
@@ -32207,32 +32334,76 @@ var Synthia = class {
         verbose,
         reason: `latest dataset has ${existing[0].row_count} rows; requested ${count}`,
         successRate: rate,
-        qualityCheckId: null
+        qualityCheckId: null,
+        seedIds
+      });
+    }
+    const reuseModel = await this.userModels.get(existing[0].user_model_id);
+    if (!await this.#groundingMatches(reuseModel.probe_session_id, seedIds)) {
+      return this.#probeAndGenerate(agent, {
+        count,
+        maxTurns,
+        verbose,
+        reason: "requested grounding differs from the latest dataset's; re-probing and regenerating",
+        successRate: rate,
+        qualityCheckId: null,
+        forceProbe: true,
+        seedIds
       });
     }
     return {
       dataset: existing[0],
-      userModel: await this.userModels.get(existing[0].user_model_id),
+      userModel: reuseModel,
       action: "reused",
       reason: rate !== null ? `success rate ${pct(rate)} within ${pct(minSuccessRate)}-${pct(maxSuccessRate)} band` : "no completed quality check to judge by; reusing latest dataset",
       successRate: rate,
       qualityCheckId: null
     };
   }
+  /** The seeds that grounded a probe session, or null if unreadable.
+   * Grounding is baked into the representation once, at probe convergence,
+   * so a session's seed set is the exact cache key for everything
+   * downstream of it. */
+  async #probeSeedIds(probeSessionId) {
+    try {
+      const ps = await this.#http.get(`/v1/probe-sessions/${probeSessionId}`);
+      return ps.seed_ids ?? [];
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 404)
+        return null;
+      throw e;
+    }
+  }
+  /** Whether a probed artifact may be reused for this request. `undefined`
+   * means the caller didn't ask about grounding, so reuse is unchanged —
+   * and short-circuits before any HTTP, which is what keeps existing
+   * callers' request sequences identical. */
+  async #groundingMatches(probeSessionId, seedIds) {
+    if (seedIds === void 0)
+      return true;
+    const attached = await this.#probeSeedIds(probeSessionId);
+    return attached !== null && sameIdSet(attached, seedIds);
+  }
   async #probeAndGenerate(agent, opts) {
     let reason = opts.reason;
     let userModel = null;
-    if (this.sessionId && !opts.qualityCheckId) {
+    if (this.sessionId && !opts.qualityCheckId && !opts.forceProbe) {
       const sessionModels = await this.userModels.list(this.sessionId);
       if (sessionModels.length) {
-        userModel = sessionModels[sessionModels.length - 1];
-        reason += "; reusing session user model (no drift signal)";
+        const candidate = sessionModels[sessionModels.length - 1];
+        if (await this.#groundingMatches(candidate.probe_session_id, opts.seedIds)) {
+          userModel = candidate;
+          reason += "; reusing session user model (no drift signal)";
+        } else {
+          reason += "; requested grounding differs from the session user model's \u2014 re-probing";
+        }
       }
     }
     if (userModel === null) {
       userModel = await this.userModels.createFromProbe(agent, {
         maxTurns: opts.maxTurns,
-        verbose: opts.verbose
+        verbose: opts.verbose,
+        ...opts.seedIds !== void 0 ? { seedIds: opts.seedIds } : {}
       });
     }
     const job = await this.datasets.generate(userModel, {
@@ -32669,7 +32840,7 @@ function redactingAgent(agent, redactor) {
     if (typeof reply !== "string") {
       if (!warnedAudio) {
         warnedAudio = true;
-        console.warn("warning: redaction does not apply to audio replies");
+        console.warn("warning: redaction does not apply to file replies");
       }
       return reply;
     }
